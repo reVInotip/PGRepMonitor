@@ -1,256 +1,191 @@
 import os
 import subprocess
 import sys
-from postgres_worker import PostgresWorker, MasterWorker
-import shutil
+from view import View
+from postgres_node import PostgresNode
 
 class PostgresCluster:
-    def __init__(self, config, view):
-        self.path_to_source = config.path_to_source
-        self.out_dir = config.out_dir
-        self.lines = config.lines
-        self.rebuild_requested = config.need_rebuild
-        self.reinit_requested = config.need_reinit
-        self.view = view
-        self.length = max(self.lines)
-        self.wait_for = config.sync_commit
-
-        if config.sync_commit == "write":
-            self.sync_commit = "remote_write" 
-        elif config.sync_commit == "flush":
-            self.sync_commit = "on"
-        else:
-            self.sync_commit = "remote_apply"
-
-        if self.rebuild_requested:
-            self.rebuild(self.out_dir, self.path_to_source, self.lines)
+    def __init__(self, config, need_rebuild, need_reinit, enable_debug):
+        self.config = config
         
-        if self.reinit_requested:
-            self.reinit(self.out_dir, self.lines)
+        self.path_to_source = self.config["path_to_source"]
+        self.count_replicas = len(self.config["cluster"]) - 1
 
-        self.nodes = []
+        nodes = []
+        i = 1
+        default_port = 10000
+        for node_conf in self.config["cluster"]:
+            node = PostgresNode(node_conf, i, default_port + i - 1)
+            nodes.append(node)
 
-        self.nodes.append([MasterWorker(self.out_dir, "master", 6432)])
-
-        j = 0
-        for line in self.lines:
-            sublist = []
-            for i in range(line):
-                sublist.append(PostgresWorker(self.out_dir, i, j, 6432 + i + (j + 1) * self.length))
-            self.nodes.append(sublist)
-            j += 1
+            if node.is_master():
+                continue
+            i += 1
         
-        self.nodes[0][0].create_test_db()
+        self.master_node = self.try_build_tree(nodes)
+        if self.master_node is None:
+            print("Some error occurred while building cluster tree")
+
+        bin_dir = os.path.join(os.getcwd(), "cluster-bin")
+
+        if not os.path.exists(bin_dir):
+            os.mkdir(bin_dir, mode=0o0777)
+        
+        self.create_containers(bin_dir)
+
+        if need_rebuild:
+            self.rebuild(enable_debug)
+
+        if need_reinit:
+            self.reinit(bin_dir)
+
+        self.start()
+
+        self.view = View()
     
-    def rebuild(self, out_dir, path_to_source, lines):
+    def try_build_tree(self, node_list):
+        master_node = None
+
+        for node in node_list:
+            if node.role == "master":
+                master_node = node
+            
+            if node.connect_to is None and node.role != "master":
+                print("Cluster tree not linked!")
+                exit(1)
+
+            for node1 in node_list:
+                if node1.connect_to == node.name:
+                    node.children.append(node1)
+                    node1.parent = node
+        
+        return master_node
+
+    
+    def create_containers(self, bin_dir):
+        print("Create containers...")
+        
+        try:
+            subprocess.run(
+                ["docker-compose", "up", "-d"],
+                env={
+                    "PATH_TO_SOURCE": f"{self.path_to_source}",
+                    "END_PORT": f"{10000 + self.count_replicas - 1}",
+                    "START_PORT": "10000",
+                    "COUNT_REPLICAS": f"{self.count_replicas}"
+                },
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Can not create containers, log {e}")
+            exit(1)
+        
+        print("Containers created successfully")
+    
+    def rebuild(self, is_debug):
         print("Rebuild started...")
-
-        if not os.path.exists(out_dir):
-            os.mkdir(out_dir, mode=0o777)
-        
-        path = os.path.join(out_dir, "master")
-        if not os.path.exists(path):
-            os.mkdir(path, mode=0o777)
         
         try:
-            subprocess.run(
-                ["./configure", f"--prefix={path}", "--without-icu"],
-                cwd=path_to_source,
-                check=True
-            )
-
-            subprocess.run(
-                ["make", "-j4" , "world"],
-                cwd=path_to_source,
-                check=True
-            )
-
-            subprocess.run(
-                ["make", "-j4" , "install-world"],
-                cwd=path_to_source,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Build node master failed, logs {e}")
-        
-        j = 0
-        for line in lines:
-            for i in range(line):
-                path = os.path.join(out_dir, str(j))
-                
-                if not os.path.exists(path):
-                    os.mkdir(path, mode=0o777)
-
-                path = os.path.join(path, str(i))
-
-                if not os.path.exists(path):
-                    os.mkdir(path, mode=0o777)
-
-                try:
-                    subprocess.run(
-                        ["./configure", f"--prefix={path}", "--without-icu"],
-                        cwd=path_to_source,
-                        check=True
-                    )
-
-                    subprocess.run(
-                        ["make", "-j4" , "world"],
-                        cwd=path_to_source,
-                        check=True
-                    )
-
-                    subprocess.run(
-                        ["make", "-j4" , "install-world"],
-                        cwd=path_to_source,
-                        check=True
-                    )
-                except subprocess.CalledProcessError as e:
-                    print(f"Build node {i} in line {j} failed, logs {e}")
-
-                print(f"Node {i} in line {j} build successfully")
-            j += 1
-        
-        print("Rebuild success")
-        
-
-    def reinit(self, out_dir, lines):
-        print("Init started...")
-
-        if not os.path.exists(out_dir):
-            print("Can not init instances")
-            sys.exit(1)
-
-        master_data = os.path.join(out_dir, "master", "data")
-        if os.path.exists(master_data):
-            shutil.rmtree(master_data)
-        
-        try:
-            subprocess.run(
-                [os.path.join("master", "bin", "pg_ctl"), "init", "-D", master_data, "-s", "-o", "-g --locale=en_US.UTF-8"],
-                check=True,
-                cwd=out_dir
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Init master node failed, logs {e}")
-
-        print("Master node inited successfully")
-
-        j = 0
-        for line in lines:
-            path_start = os.path.join(out_dir, "master", "data")
-            path_end = os.path.join(out_dir, str(j), "0", "data")
-
-            if not os.path.exists(path_start):
-                print("Can not init instances")
-                sys.exit(1)
-
-            if os.path.exists(path_end):
-                shutil.rmtree(path_end)
-
-            try:
+            if is_debug:
                 subprocess.run(
-                    [os.path.join("master", "bin", "pg_ctl"), "start", "-D", path_start, "-s", "-o", f"-p {6432}"],
+                    ["docker", "exec", "pgrepmonitor-master-1", "bash", "-c", "/scripts/build.sh -d"],
                     check=True,
-                    cwd=out_dir
                 )
-
+            else:
                 subprocess.run(
-                    ["pg_basebackup", "-h", "localhost", "-p", "6432", "-X", "stream" , "-P" ,"-R", "-C", "-S", f"slot{j}", "-v", "-D", path_end],
+                    ["docker", "exec", "pgrepmonitor-master-1", "/scripts/build.sh"],
                     check=True
                 )
-
-                subprocess.run(
-                    [os.path.join("master", "bin", "pg_ctl"), "stop", "-D", path_start, "-s"],
-                    check=True,
-                    cwd=out_dir
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Init node 0 in line {j} failed, logs {e}")
-
-            print(f"Node 0 in line {j} inited successfully")
-
-            for i in range(1, line):
-                path_start = os.path.join(out_dir, str(j), str(i - 1), "data")
-                path_end = os.path.join(out_dir, str(j), str(i), "data")
-
-                if not os.path.exists(path_start):
-                    print("Can not init instances")
-                    sys.exit(1)
-
-                if os.path.exists(path_end):
-                    shutil.rmtree(path_end)
-
-                try:
-                    subprocess.run(
-                        [os.path.join(str(j), str(i), "bin", "pg_ctl"), "start", "-D", path_start, "-s", "-o", f"-p {6432 + i + (j + 1) * self.length - 1}"],
-                        check=True,
-                        cwd=out_dir
-                    )
-
-                    subprocess.run(
-                        ["pg_basebackup", "-h", "localhost", "-p", str(6432 + i + (j + 1) * self.length - 1), "-X", "stream" , "-P" ,"-R", "-C", "-S", f"slot{j}", "-v", "-D", path_end],
-                        check=True
-                    )
-
-                    subprocess.run(
-                        [os.path.join(str(j), str(i), "bin", "pg_ctl"), "stop", "-D", path_start, "-s"],
-                        check=True,
-                        cwd=out_dir
-                    )
-                except subprocess.CalledProcessError as e:
-                    print(f"Init node {i} in line {j} failed, logs {e}")
-
-                print(f"Node {i} in line {j} inited successfully")
-            j += 1
+        except subprocess.CalledProcessError as e:
+            print(f"Build postgres failed, logs {e}")
         
-        j = 0
-        for line in lines:
-            path_start = os.path.join(out_dir, str(j), "0", "data", "postgresql.auto.conf")
-            with open(path_start, "w") as postgres_conf:
-                postgres_conf.write(f"primary_conninfo = 'host=localhost port=6432 user=grigoriy dbname=postgres application_name=line{j} fallback_application_name=line{j} replication=true'")
-            
-            for i in range(line - 1):
-                path_start = os.path.join(out_dir, str(j), str(i), "data", "postgresql.conf")
-                with open(path_start, "a") as postgres_conf:
-                    postgres_conf.write("synchronous_standby_names = 'walreceiver'\n")
-                    postgres_conf.write("log_replication_commands = on\n")
-                    postgres_conf.write("log_min_messages = debug2\n")
-                    postgres_conf.write("logging_collector = on\n")
-                    postgres_conf.write("log_destination = 'jsonlog'\n")
-            
-            path_start = os.path.join(out_dir, str(j), str(line - 1), "data", "postgresql.conf")
-            with open(path_start, "a") as postgres_conf:
-                postgres_conf.write("wal_receiver_status_interval = 1s\n")
-
-            j += 1
         
-        master_conf = os.path.join(master_data, "postgresql.conf")
+        print("Rebuild success")
+    
+    def start(self):
+        print("Start cluster...")
+        node_queue = []
+        node_queue.append(self.master_node)
 
-        height = len(lines)
-        names = f"synchronous_standby_names = 'FIRST {height} ("
-        for i in range(height):
-            names += f"line{i}"
-            if i != height - 1:
-                names += ", "
-        names += ")'\n"
-        print(names)
+        while len(node_queue) > 0:
+            node = node_queue[0]
+            node_queue.remove(node)
+            node.start_node()
 
-        with open(master_conf, "w") as postgres_conf:
-            postgres_conf.write(names)
-            postgres_conf.write("synchronous_commit=" + self.sync_commit + "\n")
-            postgres_conf.write("log_replication_commands = on\n")
-            postgres_conf.write("log_min_messages = debug2\n")
-            postgres_conf.write("logging_collector = on\n")
-            postgres_conf.write("log_destination = 'jsonlog'\n")
+            for child in node.children:
+                node_queue.append(child)
+        
+        print("Cluster started")
+    
+    def destroy_containers(self):
+        print("Destroy containers...")
+        
+        try:
+            subprocess.run(
+                ["docker-compose", "down", "-v"],
+                env={
+                    "PATH_TO_SOURCE": f"{self.path_to_source}",
+                    "END_PORT": f"{10000 + self.count_replicas - 1}",
+                    "START_PORT": "10000",
+                    "COUNT_REPLICAS": f"{self.count_replicas}"
+                },
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Can not create containers, log {e}")
+            exit(1)
+        
+        print("Containers destroyed successfully")
+    
+    def stop(self):
+        print("Stopped cluster...")
+        node_queue = []
+        node_queue.append(self.master_node)
+
+        while len(node_queue) > 0:
+            node = node_queue[0]
+            node_queue.remove(node)
+            node.stop_node()
+
+            for child in node.children:
+                node_queue.append(child)
+        
+        print("Cluster stopped")
+
+    def reinit(self, bin_dir):
+        print("Init started...")
+
+        if not os.path.exists(bin_dir):
+            print("Can not init instances without sources")
+            sys.exit(1)
+        
+        self.master_node.init_node_data()
+        
+        node = None
+
+        node_queue = []
+        node_queue.append(self.master_node)
+
+        while len(node_queue) > 0:
+            node = node_queue[0]
+            node_queue.remove(node)
+            node.start_node()
+
+            i = 1
+            for child in node.children:
+                node_queue.append(child)
+                child.init_node_data(connect_to=node.connection_info["host"], port=5432, slot_index=i)
+                i += 1
+            
+            node.init_node_config()
+            node.stop_node()
         
         print("Cluster init successfully")
     
     def main_loop(self):
         try:
-            while(True):
-                command = input("Enter command: ")
-                if command == "e":
-                    options = input("Enter options: ")
-                    self.view.show(self.lines, self.nodes, options, self.wait_for)
+            self.view.create_tmux_session_with_watch(5432, 10000, 10000 + self.count_replicas - 1)
         except KeyboardInterrupt as i:
+            self.stop()
+            self.destroy_containers()
             sys.exit(0)

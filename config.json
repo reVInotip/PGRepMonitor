@@ -1,0 +1,41 @@
+{   "path_to_source": "/home/grigoriy/Projects/PGLab/postgres",
+    "cluster": [
+        {
+            "name": "master",
+            "role": "master",
+            "sync_type": "priority",
+            "count_sync": 2,
+            "sync_stby_names": ["stby1", "stby2"],
+            "logging": true,
+            "wait_for": "apply"
+        },
+        {
+            "name": "stby1",
+            "role": "last_replica",
+            "connect_to": "master",
+            "logging": true
+        },
+        {
+            "name": "stby2",
+            "role": "replica",
+            "connect_to": "master",
+            "sync_type": "quorum",
+            "count_sync": 2,
+            "sync_stby_names": ["stby3", "stby4"],
+            "logging": true,
+            "wait_for": "apply"
+        },
+        {
+            "name": "stby3",
+            "role": "last_replica",
+            "connect_to": "stby2",
+            "logging": true
+        },
+        {
+            "name": "stby4",
+            "role": "last_replica",
+            "connect_to": "stby2",
+            "logging": true
+        }
+    ]
+}

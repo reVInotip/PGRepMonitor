@@ -1,30 +1,9 @@
-import os
 import argparse
+import json
 from postgres_cluster import PostgresCluster
-from console import ConsoleView
 
-def get_config_from_args():
+def get_args():
     parser = argparse.ArgumentParser(description='Check cascade sync replication')
-
-    parser.add_argument(
-        'path_to_source',
-        type=str,
-        help='path to PostgreSQL source code'
-    )
-
-    parser.add_argument(
-        '-o', '--out_dir',
-        type=str,
-        default=os.path.join(os.getcwd(), "tmp"),
-        help='path to output directory'
-    )
-
-    parser.add_argument(
-        '-l', '--lines',
-        nargs='+',
-        type=int,
-        default=2,
-        help='list of count ndes in line')
     
     parser.add_argument(
         '-r', '--need_rebuild',
@@ -39,24 +18,32 @@ def get_config_from_args():
     )
 
     parser.add_argument(
-        '-s', '--sync_commit',
-        type=str,
-        default='write',
-        choices=['write', 'flush', 'apply'],
-        help='synchronous_commit setting'
+        '-d', '--debug',
+        action='store_true',
+        help='Start in debug mode'
     )
 
     return parser.parse_args()
 
+def parse_cluster_config():
+    config = None
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+    
+    return config
+
 def main():
     try:
-        config = get_config_from_args()
-        postgresCluster = PostgresCluster(config=config, view=ConsoleView())
+        args = get_args()
+        config = parse_cluster_config()
+        postgresCluster = PostgresCluster(config=config, need_rebuild=args.need_rebuild,
+            need_reinit=args.need_reinit, enable_debug=args.debug)
         postgresCluster.main_loop()
     except Exception as e:
         print(f"Some error occurred: {e}")
         exit(-1)
     except KeyboardInterrupt:
+        postgresCluster.stop()
         exit(-2)
 
 if __name__ == '__main__':

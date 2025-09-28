@@ -1,0 +1,47 @@
+services:
+  postgres_template: &postgres
+    build: ${PATH_TO_SOURCE}
+    tty: true
+    cgroup: private
+    volumes:
+      - ${PATH_TO_SOURCE}:/var/lib/postgres_src
+      - ./docker-scripts:/scripts
+      - ./cluster-bin:/var/lib/postgresql
+  
+  master: &default_conf
+    <<: *postgres
+    cpu_count: 3
+    blkio_config:
+      device_read_bps:
+        - path: /dev/nvme0n1
+          rate: '500mb'
+      device_write_bps:
+        - path: /dev/nvme0n1
+          rate: '600mb'
+      device_read_iops:
+        - path: /dev/nvme0n1
+          rate: 30
+      device_write_iops:
+        - path: /dev/nvme0n1
+          rate: 30
+    deploy:
+      resources:
+        limits:
+          cpus: '2.90'
+          memory: 4G
+        reservations:
+          cpus: '2.80'
+          memory: 3.5G
+    ports:
+      - 5432:5432
+  
+  replicas:
+    <<: *default_conf
+    ports:
+      - target: 5432
+        published: ${START_PORT}-${END_PORT}
+        protocol: tcp
+        mode: host
+    deploy:
+      mode: replicated
+      replicas: ${COUNT_REPLICAS}
