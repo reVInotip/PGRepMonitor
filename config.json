@@ -3,38 +3,28 @@
         {
             "name": "master",
             "role": "master",
-            "sync_type": "priority",
-            "count_sync": 2,
-            "sync_stby_names": ["stby1", "stby2"],
+            "sync_type": "base",
+            "count_sync": 3,
+            "sync_stby_names": ["s1", "s2", "s3"],
             "logging": true,
-            "wait_for": "apply"
+            "wait_for": "flush"
         },
         {
-            "name": "stby1",
-            "role": "last_replica",
-            "connect_to": "master",
-            "logging": true
-        },
-        {
-            "name": "stby2",
+            "name": "s1",
             "role": "replica",
             "connect_to": "master",
-            "sync_type": "quorum",
-            "count_sync": 2,
-            "sync_stby_names": ["stby3", "stby4"],
-            "logging": true,
-            "wait_for": "apply"
-        },
-        {
-            "name": "stby3",
-            "role": "last_replica",
-            "connect_to": "stby2",
             "logging": true
         },
         {
-            "name": "stby4",
+            "name": "s2",
             "role": "last_replica",
-            "connect_to": "stby2",
+            "connect_to": "master",
+            "logging": true
+        },
+        {
+            "name": "s3",
+            "role": "last_replica",
+            "connect_to": "master",
             "logging": true
         }
     ]

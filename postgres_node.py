@@ -277,3 +277,5 @@ class PostgresNode:
             self.wait_for = "on"
         elif wait_for == "apply":
             self.wait_for = "remote_apply"
+        elif wait_for == "off":
+            self.wait_for = "off"

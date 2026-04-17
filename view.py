@@ -11,8 +11,8 @@ class View:
         subprocess.run([
             "tmux", "new-session", "-d", "-s", session_name, "-n", "PG_Monitor",
             "watch", "-d", "-n", "2",
-            "psql", "-h", "localhost", "-p", str(master_port), "-U", "ubuntu", "-d", "postgres", 
-            "-x", "-c", "'select * from pg_stat_replication'"
+            "\"psql", "-h", "localhost", "-p", str(master_port), "-U", "ubuntu", "-d", "postgres", 
+            "-x", "-c", "'select * from pg_stat_replication'\""
         ])
         
         for i, port in enumerate(range(start_port, end_port + 1), 1):
@@ -26,8 +26,8 @@ class View:
             subprocess.run([
                 "tmux", "split-window", split_dir, "-t", f"{session_name}:0.{i-1}",
                 "watch", "-d", "-n", "2",
-                "psql", "-h", "localhost", "-p", str(port), "-U", "ubuntu", "-d", "postgres", 
-                "-x", "-c", "'select * from pg_stat_replication'"
+                "\"psql", "-h", "localhost", "-p", str(port), "-U", "ubuntu", "-d", "postgres", 
+                "-x", "-c", "'select * from pg_stat_replication'\""
             ])
 
         # Выравниваем все панели

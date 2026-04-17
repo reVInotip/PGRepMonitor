@@ -7,31 +7,36 @@ services:
       - ${PATH_TO_SOURCE}:/var/lib/postgres_src
       - ./docker-scripts:/scripts
       - ./cluster-bin:/var/lib/postgresql
+    labels:
+      chaos: true
   
   master: &default_conf
     <<: *postgres
-    cpu_count: 3
+    cpu_count: 2
     blkio_config:
+#      weight_device:
+#        - path: /dev/nvme0n1p2
+#          weight: 1000
       device_read_bps:
         - path: /dev/nvme0n1
-          rate: '500mb'
+          rate: '1000mb'
       device_write_bps:
         - path: /dev/nvme0n1
-          rate: '600mb'
+          rate: '1200mb'
       device_read_iops:
         - path: /dev/nvme0n1
-          rate: 30
+          rate: 10000
       device_write_iops:
         - path: /dev/nvme0n1
-          rate: 30
+          rate: 10000
     deploy:
       resources:
         limits:
-          cpus: '2.90'
-          memory: 4G
+          cpus: '2.0'
+          memory: 3G
         reservations:
-          cpus: '2.80'
-          memory: 3.5G
+          cpus: '1.5'
+          memory: 2.5G
     ports:
       - 5432:5432
   
@@ -45,3 +50,22 @@ services:
     deploy:
       mode: replicated
       replicas: ${COUNT_REPLICAS}
+  
+  pumba_latency:
+    image: ghcr.io/alexei-led/pumba:latest
+    container_name: pumba_latency
+    depends_on:
+      - master
+      - replicas
+    command: >
+        --log-level debug
+        --interval 6s
+        netem --duration 5s
+        delay --time 25 --jitter 5 --correlation 80
+        re2:^pgrepmonitor
+    network_mode: "host"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - NET_ADMIN
+    restart: unless-stopped
