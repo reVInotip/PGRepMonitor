@@ -1,191 +1,181 @@
 import os
 import subprocess
 import sys
+from collections import deque
+
 from view import View
 from postgres_node import PostgresNode
 
+
 class PostgresCluster:
-    def __init__(self, config, need_rebuild, need_reinit, enable_debug):
+    BASE_PORT = 10000
+
+    def __init__(self, config, need_rebuild=False, need_reinit=False, enable_debug=False):
         self.config = config
-        
-        self.path_to_source = self.config["path_to_source"]
-        self.count_replicas = len(self.config["cluster"]) - 1
+        self.path_to_source = config["path_to_source"]
+        self.nodes = self._build_nodes(config["cluster"])
+        self.count_replicas = len(self.nodes) - 1
 
-        nodes = []
-        i = 1
-        default_port = 10000
-        for node_conf in self.config["cluster"]:
-            node = PostgresNode(node_conf, i, default_port + i - 1)
-            nodes.append(node)
+        self.master_node = self._build_tree()
+        if not self.master_node:
+            raise RuntimeError("Failed to determine master node")
 
-            if node.is_master():
-                continue
-            i += 1
-        
-        self.master_node = self.try_build_tree(nodes)
-        if self.master_node is None:
-            print("Some error occurred while building cluster tree")
+        self.bin_dir = self._ensure_bin_dir()
 
-        bin_dir = os.path.join(os.getcwd(), "cluster-bin")
-
-        if not os.path.exists(bin_dir):
-            os.mkdir(bin_dir, mode=0o0777)
-        
-        self.create_containers(bin_dir)
+        self._create_containers()
 
         if need_rebuild:
-            self.rebuild(enable_debug)
+            self._rebuild(enable_debug)
 
         if need_reinit:
-            self.reinit(bin_dir)
+            self._reinit()
 
-        self.start()
-
+        self._start()
         self.view = View()
-    
-    def try_build_tree(self, node_list):
-        master_node = None
 
-        for node in node_list:
+    # -------------------- INIT HELPERS --------------------
+
+    def _build_nodes(self, cluster_config):
+        nodes = []
+        replica_index = 1
+
+        for node_conf in cluster_config:
+            port = self.BASE_PORT + replica_index - 1
+            node = PostgresNode(node_conf, replica_index, port)
+            nodes.append(node)
+
+            if not node.is_master():
+                replica_index += 1
+
+        return nodes
+
+    def _build_tree(self):
+        master = None
+        name_map = {node.name: node for node in self.nodes}
+
+        for node in self.nodes:
             if node.role == "master":
-                master_node = node
-            
-            if node.connect_to is None and node.role != "master":
-                print("Cluster tree not linked!")
-                exit(1)
+                master = node
 
-            for node1 in node_list:
-                if node1.connect_to == node.name:
-                    node.children.append(node1)
-                    node1.parent = node
-        
-        return master_node
+            if node.role != "master" and node.connect_to is None:
+                raise ValueError(f"Node {node.name} is not connected")
 
-    
-    def create_containers(self, bin_dir):
-        print("Create containers...")
-        
+            if node.connect_to:
+                parent = name_map.get(node.connect_to)
+                if not parent:
+                    raise ValueError(f"Parent {node.connect_to} not found")
+
+                parent.children.append(node)
+                node.parent = parent
+
+        return master
+
+    def _ensure_bin_dir(self):
+        bin_dir = os.path.join(os.getcwd(), "cluster-bin")
+        os.makedirs(bin_dir, mode=0o777, exist_ok=True)
+        return bin_dir
+
+    # -------------------- DOCKER --------------------
+
+    def _docker_env(self):
+        return {
+            "PATH_TO_SOURCE": self.path_to_source,
+            "END_PORT": str(self.BASE_PORT + self.count_replicas - 1),
+            "START_PORT": str(self.BASE_PORT),
+            "COUNT_REPLICAS": str(self.count_replicas),
+        }
+
+    def _run_command(self, cmd, env=None, error_msg="Command failed"):
         try:
-            subprocess.run(
-                ["docker", "compose", "up", "-d"],
-                env={
-                    "PATH_TO_SOURCE": f"{self.path_to_source}",
-                    "END_PORT": f"{10000 + self.count_replicas - 1}",
-                    "START_PORT": "10000",
-                    "COUNT_REPLICAS": f"{self.count_replicas}"
-                },
-                check=True
-            )
+            subprocess.run(cmd, env=env, check=True)
         except subprocess.CalledProcessError as e:
-            print(f"Can not create containers, log {e}")
-            exit(1)
-        
-        print("Containers created successfully")
-    
-    def rebuild(self, is_debug):
-        print("Rebuild started...")
-        
-        try:
-            if is_debug:
-                subprocess.run(
-                    ["docker", "exec", "pgrepmonitor-master-1", "bash", "-c", "/scripts/build.sh -d"],
-                    check=True,
-                )
-            else:
-                subprocess.run(
-                    ["docker", "exec", "pgrepmonitor-master-1", "/scripts/build.sh"],
-                    check=True
-                )
-        except subprocess.CalledProcessError as e:
-            print(f"Build postgres failed, logs {e}")
-        
-        
-        print("Rebuild success")
-    
-    def start(self):
-        print("Start cluster...")
-        node_queue = []
-        node_queue.append(self.master_node)
+            raise RuntimeError(f"{error_msg}: {e}") from e
 
-        while len(node_queue) > 0:
-            node = node_queue[0]
-            node_queue.remove(node)
-            node.start_node()
+    def _create_containers(self):
+        print("Creating containers...")
+        self._run_command(
+            ["docker", "compose", "up", "-d"],
+            env=self._docker_env(),
+            error_msg="Failed to create containers"
+        )
+        print("Containers created")
 
-            for child in node.children:
-                node_queue.append(child)
-        
-        print("Cluster started")
-    
     def destroy_containers(self):
-        print("Destroy containers...")
-        
-        try:
-            subprocess.run(
-                ["docker", "compose", "down", "-v"],
-                env={
-                    "PATH_TO_SOURCE": f"{self.path_to_source}",
-                    "END_PORT": f"{10000 + self.count_replicas - 1}",
-                    "START_PORT": "10000",
-                    "COUNT_REPLICAS": f"{self.count_replicas}"
-                },
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"Can not create containers, log {e}")
-            exit(1)
-        
-        print("Containers destroyed successfully")
-    
+        print("Destroying containers...")
+        self._run_command(
+            ["docker", "compose", "down", "-v"],
+            env=self._docker_env(),
+            error_msg="Failed to destroy containers"
+        )
+        print("Containers destroyed")
+
+    def _rebuild(self, debug=False):
+        print("Rebuilding...")
+        cmd = ["/scripts/build.sh"]
+        if debug:
+            cmd = ["bash", "-c", "/scripts/build.sh -d"]
+
+        self._run_command(
+            ["docker", "exec", "pgrepmonitor-master-1"] + cmd,
+            error_msg="Build failed"
+        )
+        print("Rebuild complete")
+
+    # -------------------- CLUSTER OPS --------------------
+
+    def _bfs(self):
+        """Generator for BFS traversal"""
+        queue = deque([self.master_node])
+        while queue:
+            node = queue.popleft()
+            yield node
+            queue.extend(node.children)
+
+    def _start(self):
+        print("Starting cluster...")
+        for node in self._bfs():
+            node.start_node()
+        print("Cluster started")
+
     def stop(self):
-        print("Stopped cluster...")
-        node_queue = []
-        node_queue.append(self.master_node)
-
-        while len(node_queue) > 0:
-            node = node_queue[0]
-            node_queue.remove(node)
+        print("Stopping cluster...")
+        for node in self._bfs():
             node.stop_node()
-
-            for child in node.children:
-                node_queue.append(child)
-        
         print("Cluster stopped")
 
-    def reinit(self, bin_dir):
-        print("Init started...")
+    def _reinit(self):
+        print("Initializing cluster...")
 
-        if not os.path.exists(bin_dir):
-            print("Can not init instances without sources")
-            sys.exit(1)
-        
+        if not os.path.exists(self.bin_dir):
+            raise RuntimeError("Sources not found")
+
         self.master_node.init_node_data()
-        
-        node = None
 
-        node_queue = []
-        node_queue.append(self.master_node)
-
-        while len(node_queue) > 0:
-            node = node_queue[0]
-            node_queue.remove(node)
+        for node in self._bfs():
             node.start_node()
 
-            i = 1
-            for child in node.children:
-                node_queue.append(child)
-                child.init_node_data(connect_to=node.connection_info["host"], port=5432, slot_index=i)
-                i += 1
-            
+            for i, child in enumerate(node.children, start=1):
+                child.init_node_data(
+                    connect_to=node.connection_info["host"],
+                    port=5432,
+                    slot_index=i
+                )
+
             node.init_node_config()
             node.stop_node()
-        
-        print("Cluster init successfully")
-    
+
+        print("Cluster initialized")
+
+    # -------------------- MAIN LOOP --------------------
+
     def main_loop(self):
         try:
-            self.view.create_tmux_session_with_watch(5432, 10000, 10000 + self.count_replicas - 1)
-        except KeyboardInterrupt as i:
+            self.view.create_tmux_session_with_watch(
+                5432,
+                self.BASE_PORT,
+                self.BASE_PORT + self.count_replicas - 1
+            )
+        except KeyboardInterrupt:
             self.stop()
             self.destroy_containers()
             sys.exit(0)
