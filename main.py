@@ -49,7 +49,7 @@ def main():
             path_to_source = config["path_to_source"]
 
             subprocess.run(
-                ["docker-compose", "down", "-v"],
+                ["docker", "compose", "down", "-v"],
                 env={
                     "PATH_TO_SOURCE": f"{path_to_source}",
                     "END_PORT": f"{10000 + count_replicas - 1}",

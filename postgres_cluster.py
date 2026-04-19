@@ -67,7 +67,7 @@ class PostgresCluster:
         
         try:
             subprocess.run(
-                ["docker-compose", "up", "-d"],
+                ["docker", "compose", "up", "-d"],
                 env={
                     "PATH_TO_SOURCE": f"{self.path_to_source}",
                     "END_PORT": f"{10000 + self.count_replicas - 1}",
@@ -122,7 +122,7 @@ class PostgresCluster:
         
         try:
             subprocess.run(
-                ["docker-compose", "down", "-v"],
+                ["docker", "compose", "down", "-v"],
                 env={
                     "PATH_TO_SOURCE": f"{self.path_to_source}",
                     "END_PORT": f"{10000 + self.count_replicas - 1}",
