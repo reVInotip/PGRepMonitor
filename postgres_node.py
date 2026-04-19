@@ -1,281 +1,268 @@
 import subprocess
 import psycopg2
+from psycopg2.extras import RealDictCursor
+
 
 class PostgresNode:
+    DOCKER_CMD = ["docker", "exec"]
+
     def __init__(self, node_config, index, port):
         self.name = None
         self.role = None
         self.sync_type = None
         self.count_sync = None
-        self.sync_stby_names = None
-        self.logging = None
+        self.sync_standby_names = None
+        self.logging = True
         self.wait_for = None
         self.connect_to = None
         self.conn_type = "async"
+
         self.index = index
-        self.connection_info = None
         self.children = []
         self.parent = None
+        self.connection_info = None
 
+        self._parse_cluster_config(node_config)
+        self._validate_config()
+        self._set_connection_info(port)
+
+        self._connection = self._connect()
+
+    # -------------------- CONNECTION --------------------
+
+    def _connect(self):
+        return psycopg2.connect(
+            host="localhost",
+            port=self.connection_info["port"],
+            user="ubuntu",
+            dbname="postgres"
+        )
+
+    def close(self):
+        if self._connection:
+            self._connection.close()
+
+    # -------------------- HELPERS --------------------
+
+    def _run(self, cmd, error_msg):
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"{error_msg}: {e}") from e
+
+    def _docker_exec(self, script):
+        cmd = self.DOCKER_CMD + [
+            self.connection_info["host"],
+            "bash", "-c", script
+        ]
+        self._run(cmd, f"Command failed on {self.name}")
+
+    # -------------------- INIT --------------------
+
+    def _set_connection_info(self, port):
+        if self.role == "master":
+            self.connection_info = {"host": "pgrepmonitor-master-1", "port": 5432}
+        else:
+            self.connection_info = {
+                "host": f"pgrepmonitor-replicas-{self.index}",
+                "port": port
+            }
+
+    def _validate_config(self):
+        if not self.name or not self.role:
+            raise ValueError("Node must have name and role")
+
+        if all(v is None for v in [self.sync_type, self.sync_standby_names, self.wait_for]):
+            self.conn_type = "async"
+        elif all(v is not None for v in [self.sync_type, self.sync_standby_names, self.wait_for]):
+            self.conn_type = "sync"
+        else:
+            raise ValueError("Invalid sync configuration")
+
+        if self.sync_type and self.sync_type != "base":
+            if not self.count_sync or self.count_sync <= 0:
+                raise ValueError("Invalid count_sync")
+
+        if self.role in ["replica", "last_replica"] and not self.connect_to:
+            raise ValueError(f"{self.name} must have connect_to")
+
+    # -------------------- INIT DATA --------------------
+
+    def init_node_data(self, connect_to=None, port=None, slot_index=None):
+        if self.role == "master":
+            self._docker_exec("/scripts/master_init.sh")
+            return
+
+        primary_conninfo = (
+            f"host={connect_to} port=5432 user=ubuntu "
+            f"application_name={self.name} replication=true"
+        )
+
+        if self.role == "replica":
+            script = f"/scripts/replica_init.sh {connect_to} {port} slot{slot_index} '{primary_conninfo}'"
+        else:
+            script = f"/scripts/end_replica_init.sh {connect_to} {port} slot{slot_index} '{primary_conninfo}'"
+
+        self._docker_exec(script)
+
+    # -------------------- CONFIG --------------------
+
+    def init_node_config(self):
+        if self.conn_type == "async":
+            script = self._async_config_script()
+        else:
+            script = self._sync_config_script()
+
+        self._docker_exec(script)
+
+    def _async_config_script(self):
+        if self.role == "master":
+            return f"/scripts/master_config_init_async.sh {self.logging}"
+        elif self.role == "replica":
+            return f"/scripts/replica_config_init_async.sh {self.logging}"
+        else:
+            return f"/scripts/end_replica_config_init.sh {self.logging}"
+
+    def _sync_config_script(self):
+        sync_names = self._build_sync_standby_names()
+
+        if self.role == "master":
+            return f"/scripts/master_config_init_sync.sh {self.logging} '{self.wait_for}' '{sync_names}'"
+        elif self.role == "replica":
+            return f"/scripts/replica_config_init_sync.sh {self.logging} '{self.wait_for}' '{sync_names}'"
+        else:
+            return f"/scripts/end_replica_config_init.sh {self.logging}"
+
+    def _build_sync_standby_names(self):
+        names = ", ".join(self.sync_standby_names)
+
+        if self.sync_type == "base":
+            return names
+        elif self.sync_type == "priority":
+            return f"FIRST {self.count_sync} ({names})"
+        else:
+            return f"ANY {self.count_sync} ({names})"
+
+    # -------------------- LIFECYCLE --------------------
+
+    def start_node(self):
+        self._docker_exec("/scripts/start.sh")
+
+    def stop_node(self):
+        self._docker_exec("/scripts/stop.sh")
+
+    # -------------------- STATS --------------------
+
+    def get_replication_data(self):
+        try:
+            with self._connection.cursor(cursor_factory=RealDictCursor) as cur:
+                if self._is_last_replica():
+                    return self._get_replica_lsn(cur)
+                else:
+                    return self._get_replication_info(cur)
+
+        except psycopg2.Error as e:
+            raise RuntimeError(f"Failed to fetch replication data: {e}") from e
+
+    def _get_replica_lsn(self, cur):
+        cur.execute("""
+            SELECT
+                pg_last_wal_replay_lsn()::text AS replay_lsn,
+                pg_last_wal_receive_lsn()::text AS receive_lsn
+        """)
+
+        row = cur.fetchone()
+
+        return (
+            f"{self.connection_info['host']}\n"
+            f"-------------------\n"
+            f"replay_lsn: {row['replay_lsn']}\n"
+            f"receive_lsn: {row['receive_lsn']}"
+        )
+
+    def _get_replication_info(self, cur):
+        cur.execute("""
+            SELECT
+                application_name,
+                client_addr,
+                state,
+                sync_state,
+                sent_lsn,
+                write_lsn,
+                flush_lsn,
+                replay_lsn
+            FROM pg_stat_replication
+        """)
+
+        rows = cur.fetchall()
+
+        lines = [
+            (
+                f"""
+                    application_name: {r['application_name']}
+                    client_addr: {r['client_addr']}
+                    state: {r['state']}
+                    sync_state: {r['sync_state']}
+                    sent_lsn: {r['sent_lsn']}
+                    write_lsn: {r['write_lsn']}
+                    flush_lsn: {r['flush_lsn']}
+                    replay_lsn: {r['replay_lsn']}
+                """
+            )
+            for r in rows
+        ]
+
+        return (
+            f"{self.connection_info['host']}\n"
+            f"-------------------\n" +
+            "\n".join(lines)
+        )
+
+    # -------------------- UTILS --------------------
+
+    def is_master(self):
+        return self.role == "master"
+
+    def _is_last_replica(self):
+        return self.role == "last_replica"
+
+    # -------------------- PARSER --------------------
+
+    def _parse_cluster_config(self, node_config):
         for key, value in node_config.items():
             match key:
                 case "name":
                     self.name = value
                 case "role":
-                    self.parse_role(value)
+                    self._parse_role(value)
                 case "sync_type":
-                    self.parse_sync_type(value)
+                    self._parse_sync_type(value)
                 case "count_sync":
                     self.count_sync = value
-                case "sync_stby_names":
-                    self.sync_stby_names = value
+                case "sync_standby_names":
+                    self.sync_standby_names = value
                 case "logging":
                     self.logging = value
                 case "wait_for":
-                    self.parse_wait_for(value)
+                    self._parse_wait_for(value)
                 case "connect_to":
                     self.connect_to = value
-            
-        self.check_options_combinations()
-        self.set_connection_info(port)
 
-    def is_master(self):
-        return self.role == "master"
-    
-    def set_connection_info(self, port):
-        # host - host in docker network (port in docker network always 5432)
-        # port - port for outer connections (host in outer connections always localhost)
-        if self.role == "master":
-            self.connection_info = {"host": "pgrepmonitor-master-1", "port": 5432}
-        else:
-            self.connection_info = {"host": f"pgrepmonitor-replicas-{self.index}", "port": port}
-    
-    def init_node_data(self, connect_to = None, port = None, slot_index = None):
-        if self.role == "master":
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c", "/scripts/master_init.sh"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Init master node failed, logs {e}")
-            
-            print("Master node inited successfully")
-        
-        primary_conninfo =\
-            f"host={connect_to} port=5432 user=ubuntu application_name={self.name} fallback_application_name={self.name} replication=true"
-        if self.role == "replica":
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash",
-                    "-c", f"/scripts/replica_init.sh {connect_to} {port} slot{slot_index} '{primary_conninfo}'"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Init cascade replica node {self.name} failed, logs {e}")
-            
-            print(f"Cascade replica node {self.name} inited successfully")
-        elif self.role == "last_replica":
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash",
-                    "-c", f"/scripts/end_replica_init.sh {connect_to} {port} slot{slot_index} '{primary_conninfo}'"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Init last replica node {self.name} failed, logs {e}")
-            
-            print(f"Last replica node {self.name} inited successfully")
-        
-    def init_node_config(self):
-        if self.role == "master":
-            try:
-                if self.conn_type == "async":
-                    subprocess.run(
-                        ["docker", "exec", self.connection_info["host"], "bash", "-c",
-                        f"/scripts/master_config_init_async.sh {self.logging}"],
-                        check=True,
-                    )
-                elif self.conn_type == "sync":
-                    sync_stby_names_str = None
+    def _parse_role(self, role):
+        if role not in ["master", "replica", "last_replica"]:
+            raise ValueError("Invalid role")
+        self.role = role
 
-                    if self.sync_type == "base":
-                        sync_stby_names_str = ", ".join(self.sync_stby_names)
-                    elif self.sync_type == "priority":
-                        sync_stby_names_str = "FIRST " + str(self.count_sync) + " (" + ", ".join(self.sync_stby_names) + ")"
-                    else:
-                        sync_stby_names_str = "ANY " + str(self.count_sync) + " (" + ", ".join(self.sync_stby_names) + ")"
-                    
-                    subprocess.run(
-                        ["docker", "exec", self.connection_info["host"], "bash", "-c",
-                        f"/scripts/master_config_init_sync.sh {self.logging} '{self.wait_for}' '{sync_stby_names_str}'"],
-                        check=True,
-                    )
-            except subprocess.CalledProcessError as e:
-                print(f"Init master node config failed, logs {e}")
-            
-            print("Master node config initted")
-            return
-        elif self.role == "replica":
-            try:
-                if self.conn_type == "async":
-                    subprocess.run(
-                        ["docker", "exec", self.connection_info["host"], "bash", "-c",
-                        f"/scripts/replica_config_init_async.sh {self.logging}"],
-                        check=True,
-                    )
-                elif self.conn_type == "sync":
-                    sync_stby_names_str = None
+    def _parse_sync_type(self, sync_type):
+        if sync_type not in ["quorum", "priority", "base"]:
+            raise ValueError("Invalid sync type")
+        self.sync_type = sync_type
 
-                    if self.sync_type == "base":
-                        sync_stby_names_str = ", ".join(self.sync_stby_names)
-                    elif self.sync_type == "priority":
-                        sync_stby_names_str = "FIRST " + str(self.count_sync) + " (" + ", ".join(self.sync_stby_names) + ")"
-                    else:
-                        sync_stby_names_str = "ANY " + str(self.count_sync) + " (" + ", ".join(self.sync_stby_names) + ")"
-                    
-                    subprocess.run(
-                        ["docker", "exec", self.connection_info["host"], "bash", "-c",
-                        f"/scripts/replica_config_init_sync.sh {self.logging} '{self.wait_for}' '{sync_stby_names_str}'"],
-                        check=True,
-                    )
-            except subprocess.CalledProcessError as e:
-                print(f"Init replica node config failed, logs {e}")
-            
-            print("Replica node config initted")
-        else:
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c",
-                    f"/scripts/end_replica_config_init.sh {self.logging}"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Init last replica node config failed, logs {e}")
-            
-            print("Last replica node config initted")
-    
-    def start_node(self):
-        if self.role == "master":
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c", "/scripts/start.sh"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Start master node failed, logs {e}")
-            
-            print("Master node started")
-        else:
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c", "/scripts/start.sh"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Start replica node {self.name} failed, logs {e}")
-            
-            print(f"Replica node {self.name} started")
-    
-    def stop_node(self):
-        if self.role == "master":
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c", "/scripts/stop.sh"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Stop master node failed, logs {e}")
-            
-            print("Master node stopped")
-        else:
-            try:
-                subprocess.run(
-                    ["docker", "exec", self.connection_info["host"], "bash", "-c", "/scripts/stop.sh"],
-                    check=True,
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"Stop replica node {self.name} failed, logs {e}")
-            
-            print(f"Replica node {self.name} stopped")
-    
-    def get_replication_data(self):
-        try:
-            conn = psycopg2.connect(host="localhost", port=self.connection_info["port"], user="ubuntu", dbname="postgres")
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT 
-                    application_name, 
-                    client_addr, 
-                    state, 
-                    sync_state,
-                    sent_lsn,
-                    write_lsn,
-                    flush_lsn,
-                    replay_lsn
-                FROM pg_stat_replication
-            """)
-            
-            data = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            
-            return data
-            
-        except psycopg2.Error as e:
-            print(f"Error data get: {e}")
-            return []
-
-    def check_options_combinations(self):
-        # required options check
-        if (self.name is None) or (self.role is None):
-            print("Name and role for node is required")
-            exit(1)
-        
-        # check combinations
-        if (self.sync_type is None) and (self.sync_stby_names is None) and (self.wait_for is None):
-            self.conn_type = "async"
-        elif (self.sync_type is not None) and (self.sync_stby_names is not None) and (self.wait_for is not None):
-            self.conn_type = "sync"
-        else:
-            print("Error1")
-            print(str(self.sync_type) + " " + str(self.sync_stby_names) + " " + str(self.wait_for))
-            exit(1)
-        
-        if self.sync_type is not None and self.sync_type != "base" and (self.count_sync is None or self.count_sync <= 0):
-            print("Error2")
-            print(str(self.sync_type) + " " + str(self.count_sync))
-            exit(2)
-        
-        if (self.role in ["replica", "last_replica"]) and (self.connect_to is None):
-            print("Error3")
-            exit(3)
-        
-        # check unimportant options
-        if self.logging is None:
-            self.logging = True
-    
-    def parse_role(self, role):
-        if role in ["master", "replica", "last_replica"]:
-            self.role = role
-        else:
-            print("Invalid role")
-            exit(1)
-
-    def parse_sync_type(self, type):
-        if type in ["quorum", "priority", "base"]:
-            self.sync_type = type
-        else:
-            print("Invalid type")
-            exit(1)
-    
-    def parse_wait_for(self, wait_for):
-        if wait_for == "write":
-            self.wait_for = "remote_write"
-        elif wait_for == "flush":
-            self.wait_for = "on"
-        elif wait_for == "apply":
-            self.wait_for = "remote_apply"
-        elif wait_for == "off":
-            self.wait_for = "off"
+    def _parse_wait_for(self, wait_for):
+        mapping = {
+            "write": "remote_write",
+            "flush": "on",
+            "apply": "remote_apply",
+            "off": "off"
+        }
+        self.wait_for = mapping.get(wait_for)

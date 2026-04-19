@@ -3,14 +3,13 @@ import subprocess
 import sys
 from collections import deque
 
-from view import View
 from postgres_node import PostgresNode
 
 
 class PostgresCluster:
     BASE_PORT = 10000
 
-    def __init__(self, config, need_rebuild=False, need_reinit=False, enable_debug=False):
+    def __init__(self, config, view, need_rebuild=False, need_reinit=False, enable_debug=False):
         self.config = config
         self.path_to_source = config["path_to_source"]
         self.nodes = self._build_nodes(config["cluster"])
@@ -31,7 +30,7 @@ class PostgresCluster:
             self._reinit()
 
         self._start()
-        self.view = View()
+        self.view = view
 
     # -------------------- INIT HELPERS --------------------
 
