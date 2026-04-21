@@ -169,11 +169,7 @@ class PostgresCluster:
 
     def main_loop(self):
         try:
-            self.view.create_tmux_session_with_watch(
-                5432,
-                self.BASE_PORT,
-                self.BASE_PORT + self.count_replicas - 1
-            )
+            self.view.create_tmux_session_with_watch(self.count_replicas)
         except KeyboardInterrupt:
             self.stop()
             self.destroy_containers()

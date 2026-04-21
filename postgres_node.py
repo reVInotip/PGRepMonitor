@@ -26,7 +26,7 @@ class PostgresNode:
         self._validate_config()
         self._set_connection_info(port)
 
-        self._connection = self._connect()
+        self._connection = None #self._connect()
 
     # -------------------- CONNECTION --------------------
 
@@ -38,9 +38,9 @@ class PostgresNode:
             dbname="postgres"
         )
 
-    def close(self):
-        if self._connection:
-            self._connection.close()
+    #def close(self):
+    #    if self._connection:
+    #        self._connection.close()
 
     # -------------------- HELPERS --------------------
 

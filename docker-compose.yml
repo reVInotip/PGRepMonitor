@@ -3,6 +3,8 @@ services:
     build: .
     tty: true
     cgroup: private
+    environment:
+      - LD_LIBRARY_PATH=/var/lib/postgresql/lib:$LD_LIBRARY_PATH
     volumes:
       - ${PATH_TO_SOURCE}:/var/lib/postgres_src
       - ./docker-scripts:/scripts

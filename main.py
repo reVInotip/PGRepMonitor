@@ -2,6 +2,8 @@ import argparse
 import json
 import subprocess
 from postgres_cluster import PostgresCluster
+from view import View
+import traceback
 
 def get_args():
     parser = argparse.ArgumentParser(description='Check cascade sync replication')
@@ -61,18 +63,19 @@ def main():
             
             print("Containers shutdown successfully")
         else:
-            postgresCluster = PostgresCluster(config=config, need_rebuild=args.need_rebuild,
+            postgresCluster = PostgresCluster(config=config, view=View(), need_rebuild=args.need_rebuild,
                 need_reinit=args.need_reinit, enable_debug=args.debug)
             postgresCluster.main_loop()
-    except Exception as e:
-        print(f"Some error occurred: {e}")
-        exit(-1)
     except subprocess.CalledProcessError as e:
         print(f"Can not create containers, log {e}")
         exit(-2)
     except KeyboardInterrupt:
         postgresCluster.stop()
         exit(-3)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Some error occurred: {e}")
+        exit(-1)
 
 if __name__ == '__main__':
     main()

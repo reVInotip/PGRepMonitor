@@ -1,7 +1,7 @@
 import subprocess
 
 class View:    
-    def create_tmux_session_with_watch(self, master_port, start_port, end_port):
+    def create_tmux_session_with_watch(self, count_replicas):
         session_name = "postgres_monitor"
 
         # Убиваем старую сессию если есть
@@ -11,11 +11,12 @@ class View:
         subprocess.run([
             "tmux", "new-session", "-d", "-s", session_name, "-n", "PG_Monitor",
             "watch", "-d", "-n", "2",
-            "\"./cluster-bin/bin/psql", "-h", "localhost", "-p", str(master_port), "-U", "ubuntu", "-d", "postgres", 
-            "-x", "-c", "'select * from pg_stat_replication'\""
+            "docker", "container", "exec", "pgrepmonitor-master-1",
+            "/var/lib/postgresql/bin/psql", "-h", "localhost", "-p", "5432", "-U", "ubuntu", "-d", "postgres", 
+            "-x", "-c", "'select * from pg_stat_replication'"
         ])
         
-        for i, port in enumerate(range(start_port, end_port + 1), 1):
+        for i in range(1, count_replicas + 1):
             # Определяем направление разделения
             if i % 2 == 1:
                 split_dir = "-v"  # Вертикальное разделение
@@ -26,8 +27,9 @@ class View:
             subprocess.run([
                 "tmux", "split-window", split_dir, "-t", f"{session_name}:0.{i-1}",
                 "watch", "-d", "-n", "2",
-                "\"./cluster-bin/bin/psql", "-h", "localhost", "-p", str(port), "-U", "ubuntu", "-d", "postgres", 
-                "-x", "-c", "'select * from pg_stat_replication'\""
+                "docker", "container", "exec", f"pgrepmonitor-replicas-{i}",
+                "/var/lib/postgresql/bin/psql", "-h", "localhost", "-p", "5432", "-U", "ubuntu", "-d", "postgres", 
+                "-x", "-c", "'select * from pg_stat_replication'"
             ])
 
         # Выравниваем все панели

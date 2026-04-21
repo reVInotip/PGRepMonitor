@@ -5,7 +5,7 @@
             "role": "master",
             "sync_type": "base",
             "count_sync": 3,
-            "sync_stby_names": ["s1", "s2", "s3"],
+            "sync_standby_names": ["s1", "s2", "s3"],
             "logging": true,
             "wait_for": "flush"
         },
