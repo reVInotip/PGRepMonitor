@@ -40,7 +40,7 @@ tps_values=()
 latency_values=()
 
 for i in {1..10}; do
-    result=$(pgbench -h $host -U ubuntu -d postgres -p 5432 -c 100 -j 2 \
+    result=$(pgbench -h $host -U ubuntu -d postgres -p 5432 -c 1000 -j 50 \
         -t 1 -f $PWD/tests/sql/large_insert.sql 2>&1)
     tps=$(echo "$result" | grep -oP 'tps = \K[0-9.]+' | head -1)
     latency=$(echo "$result" | grep -oP 'latency average = \K[0-9.]+')

@@ -9,3 +9,4 @@ cd /var/lib/postgresql
 echo "host all all all trust" >> /var/lib/postgres-data/pg_hba.conf
 echo "host replication all all trust" >> /var/lib/postgres-data/pg_hba.conf
 echo "listen_addresses = '*'" >> /var/lib/postgres-data/postgresql.conf
+echo "max_connections = 1000" >> /var/lib/postgres-data/postgresql.conf
